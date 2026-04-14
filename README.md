@@ -1,3 +1,5 @@
+![screenshot](https://raw.githubusercontent.com/Yusufibin/gg-google/refs/heads/main/screen.png)
+
 # gg — AI terminal assistant
 
 A lightweight AI assistant that lives in your terminal. Ask questions, get answers with live Google search context, and hold multi-turn conversations — powered by [LangGraph](https://github.com/langchain-ai/langgraph), [Nemotron](https://openrouter.ai/nvidia/nemotron-3-nano-30b-a3b:free) via OpenRouter, and [Serper](https://serper.dev/).
