@@ -5,11 +5,12 @@
 #   "langgraph>=0.2",
 #   "langchain-openai>=0.1",
 #   "langchain-core>=0.2",
+#   "rich>=13",
 # ]
 # ///
 #
 # ─────────────────────────────────────────────────────────────────────────────
-#  gg — AI-powered terminal assistant (LangGraph + Nemotron + Serper)
+#  gg — AI-powered terminal assistant (LangGraph + Nemotron + Serper + Rich)
 # ─────────────────────────────────────────────────────────────────────────────
 #
 #  REQUIREMENTS
@@ -64,19 +65,44 @@ from langchain_core.messages import (
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.live import Live
+from rich.text import Text
+from rich.rule import Rule
+from rich.theme import Theme
+from rich.prompt import Prompt
+from rich import box
+
+# ─── Rich console setup ───────────────────────────────────────────────────────
+
+custom_theme = Theme({
+    "info":    "cyan",
+    "warning": "yellow",
+    "error":   "bold red",
+    "muted":   "grey62",
+    "success": "bold green",
+    "user":    "bold yellow",
+    "gg":      "bold cyan",
+})
+
+console = Console(theme=custom_theme, highlight=True)
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 MODEL    = "nvidia/nemotron-3-nano-30b-a3b:free"
 BASE_URL = "https://openrouter.ai/api/v1"
 
-OPENROUTER_KEY     = os.environ.get("OPENROUTER_API_KEY", "")
-SERPER_KEY         = os.environ.get("SERPER_API_KEY", "")
+OPENROUTER_KEY     = os.environ.get("OPENROUTER_API_KEY")
+SERPER_KEY         = os.environ.get("SERPER_API_KEY")
 SERPER_NUM_RESULTS = 5
 
 SYSTEM_BASE = (
     "You are a helpful and concise AI assistant running in a terminal. "
     "Answer directly and clearly. "
-    "Avoid unnecessary markdown (no ** or ##) unless writing code. "
+    "Use markdown formatting: headers, bold, bullet lists, code blocks — "
+    "they will be rendered beautifully. "
     "If you are unsure about something, say so explicitly."
 )
 
@@ -87,7 +113,6 @@ SYSTEM_WITH_SEARCH = (
     "Cite your sources when relevant (just the site name is enough)."
 )
 
-# Prompt for the router node — must return strict JSON, nothing else
 ROUTER_SYSTEM = """\
 You are a routing assistant. Given a user question (and optional recent conversation),
 decide if a live web search is needed to answer accurately.
@@ -107,31 +132,16 @@ Search is NOT needed when the question:
 Respond ONLY with valid JSON — no markdown, no explanation, nothing else:
 {"needs_search": true/false, "query": "<optimized English search query or empty string>", "reason": "<one short sentence>"}"""
 
-# ─── ANSI colors ──────────────────────────────────────────────────────────────
-
-CYAN   = "\033[96m"
-YELLOW = "\033[93m"
-GRAY   = "\033[90m"
-GREEN  = "\033[92m"
-RED    = "\033[91m"
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-
 # ─── LangGraph state ──────────────────────────────────────────────────────────
-#
-# web_mode : "auto" | "force_on" | "force_off"
-#   - "auto"      → router decides each turn
-#   - "force_on"  → always search  (-w flag)
-#   - "force_off" → never search   (-n flag)
 
 class GGState(TypedDict):
     messages:       Annotated[list[BaseMessage], add]
     question:       str
     search_results: str
     web_mode:       str   # "auto" | "force_on" | "force_off"
-    will_search:    bool  # final decision made by router_node
-    search_query:   str   # refined query (may differ from raw question)
-    search_reason:  str   # shown to user in terminal
+    will_search:    bool
+    search_query:   str
+    search_reason:  str
 
 # ─── Startup checks ───────────────────────────────────────────────────────────
 
@@ -142,24 +152,18 @@ def check_env() -> None:
     if not SERPER_KEY:
         missing.append("SERPER_API_KEY")
     if missing:
-        print(f"\n{RED}✗  Missing environment variable(s): {', '.join(missing)}{RESET}")
-        print(f"{GRAY}   Add them to your ~/.zshrc or ~/.bashrc:{RESET}")
+        console.print(f"\n[error]✗  Variable(s) d'environnement manquante(s) : {', '.join(missing)}[/error]")
+        console.print("[muted]   Ajoutez-les dans ~/.zshrc ou ~/.bashrc :[/muted]")
         for var in missing:
-            print(f"{GRAY}   export {var}=\"your-key-here\"{RESET}")
-        print()
+            console.print(f"[muted]   export {var}=\"your-key-here\"[/muted]")
+        console.print()
         sys.exit(1)
 
 # ─── Node 0 : router ─────────────────────────────────────────────────────────
-#
-# Three paths:
-#   force_off → will_search=False, no LLM call
-#   force_on  → will_search=True,  no LLM call, raw question as query
-#   auto      → asks the LLM; also refines the search query if needed
 
 def router_node(state: GGState) -> dict:
     mode = state.get("web_mode", "auto")
 
-    # ── Forced off ──────────────────────────────────────────────────────────
     if mode == "force_off":
         return {
             "will_search":   False,
@@ -167,7 +171,6 @@ def router_node(state: GGState) -> dict:
             "search_reason": "web désactivé (-n)",
         }
 
-    # ── Forced on ───────────────────────────────────────────────────────────
     if mode == "force_on":
         return {
             "will_search":   True,
@@ -175,7 +178,6 @@ def router_node(state: GGState) -> dict:
             "search_reason": "web forcé (-w)",
         }
 
-    # ── Auto : ask the LLM ───────────────────────────────────────────────────
     llm = ChatOpenAI(
         model=MODEL,
         api_key=OPENROUTER_KEY,
@@ -184,8 +186,6 @@ def router_node(state: GGState) -> dict:
         temperature=0,
     )
 
-    # Include recent conversation so the router can detect follow-up questions
-    # that don't need a fresh search
     recent_context = ""
     history = state.get("messages", [])
     if history:
@@ -205,7 +205,6 @@ def router_node(state: GGState) -> dict:
         ])
         raw = resp.content.strip()
 
-        # Strip accidental markdown fences the model might add
         if raw.startswith("```"):
             parts = raw.split("```")
             raw   = parts[1].lstrip("json").strip() if len(parts) > 1 else raw
@@ -216,7 +215,6 @@ def router_node(state: GGState) -> dict:
         reason       = parsed.get("reason", "")
 
     except Exception as e:
-        # Routing failed → default to searching to avoid wrong answers
         needs_search = True
         query        = state["question"]
         reason       = f"erreur router ({e}), recherche par défaut"
@@ -233,11 +231,14 @@ def after_router(state: GGState) -> str:
     if state.get("will_search"):
         reason = state.get("search_reason", "")
         query  = state.get("search_query", "")
-        print(f"{GRAY}⟳  recherche · {reason} · \"{query}\"{RESET}", flush=True)
+        console.print(
+            f"[muted]⟳  Recherche web[/muted] · [muted]{reason}[/muted] · "
+            f"[info]\"{query}\"[/info]"
+        )
         return "search"
     else:
         reason = state.get("search_reason", "")
-        print(f"{GRAY}✦  pas de recherche · {reason}{RESET}", flush=True)
+        console.print(f"[muted]✦  Sans recherche · {reason}[/muted]")
         return "llm"
 
 # ─── Node 1 : web search (Serper) ────────────────────────────────────────────
@@ -259,18 +260,16 @@ def search_node(state: GGState) -> dict:
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
     except Exception as e:
-        print(f"{YELLOW}⚠  Recherche échouée : {e}{RESET}", flush=True)
+        console.print(f"[warning]⚠  Recherche échouée : {e}[/warning]")
         return {"search_results": f"[Search failed: {e}]"}
 
     parts = []
 
-    # Answer box: direct Google answer when available
     if ab := data.get("answerBox"):
         answer = ab.get("answer") or ab.get("snippet", "")
         if answer:
             parts.append(f"Direct answer: {answer}")
 
-    # Organic results: title + snippet + URL
     for r in data.get("organic", [])[:SERPER_NUM_RESULTS]:
         title   = r.get("title", "")
         snippet = r.get("snippet", "")
@@ -302,27 +301,49 @@ def llm_node(state: GGState) -> dict:
     messages_to_send.extend(state.get("messages", []))
     messages_to_send.append(HumanMessage(content=state["question"]))
 
-    print(f"\n{CYAN}{BOLD}gg ›{RESET} ", end="", flush=True)
     full_response: list[str] = []
 
-    try:
-        for chunk in llm.stream(messages_to_send):
-            token = chunk.content
-            if token:
-                print(token, end="", flush=True)
-                full_response.append(token)
-    except Exception as e:
-        print(f"\n{RED}API error: {e}{RESET}")
-        sys.exit(1)
+    # ── Streaming avec Live : mise à jour du Markdown en temps réel ──────────
+    console.print()
 
-    print("\n")
+    with Live(
+        Panel(
+            Text("…", style="muted"),
+            title="[gg]gg[/gg]",
+            border_style="cyan",
+            box=box.ROUNDED,
+            padding=(0, 1),
+        ),
+        console=console,
+        refresh_per_second=12,
+        vertical_overflow="visible",
+    ) as live:
+        try:
+            for chunk in llm.stream(messages_to_send):
+                token = chunk.content
+                if token:
+                    full_response.append(token)
+                    accumulated = "".join(full_response)
+                    live.update(
+                        Panel(
+                            Markdown(accumulated),
+                            title="[gg]gg[/gg]",
+                            border_style="cyan",
+                            box=box.ROUNDED,
+                            padding=(0, 1),
+                        )
+                    )
+        except Exception as e:
+            console.print(f"\n[error]Erreur API : {e}[/error]")
+            sys.exit(1)
+
+    console.print()
 
     return {
         "messages": [
             HumanMessage(content=state["question"]),
             AIMessage(content="".join(full_response)),
         ],
-        # Reset per-turn search state so the next question starts clean
         "search_results": "",
         "will_search":    False,
         "search_query":   "",
@@ -330,10 +351,6 @@ def llm_node(state: GGState) -> dict:
     }
 
 # ─── Graph construction ───────────────────────────────────────────────────────
-#
-#  [router]
-#     ├─ will_search=True  ──► [search] ──► [llm] ──► END
-#     └─ will_search=False ──────────────► [llm] ──► END
 
 def build_graph():
     graph = StateGraph(GGState)
@@ -380,28 +397,30 @@ def interactive_mode(web_mode: str) -> None:
     history: list[BaseMessage] = []
 
     if web_mode == "force_off":
-        mode_label = f"{RED}(web off){RESET}"
+        mode_badge = "[error](web off)[/error]"
     elif web_mode == "force_on":
-        mode_label = f"{GREEN}(web toujours on){RESET}"
+        mode_badge = "[success](web toujours on)[/success]"
     else:
-        mode_label = f"{CYAN}(web auto){RESET}"
+        mode_badge = "[info](web auto)[/info]"
 
-    print(
-        f"\n{CYAN}{BOLD}gg — mode interactif{RESET}  {mode_label}  "
-        f"{GRAY}Ctrl+C ou 'exit' pour quitter{RESET}\n"
-    )
+    console.print()
+    console.print(Rule(f"[gg]gg[/gg] — mode interactif  {mode_badge}  [muted]Ctrl+C ou 'exit' pour quitter[/muted]"))
+    console.print()
 
     while True:
         try:
-            user_input = input(f"{YELLOW}vous › {RESET}").strip()
+            user_input = Prompt.ask("[user]vous ›[/user]").strip()
         except (KeyboardInterrupt, EOFError):
-            print(f"\n{GRAY}À bientôt !{RESET}\n")
+            console.print("\n[muted]À bientôt ![/muted]\n")
             break
 
         if not user_input:
             continue
+
+        if user_input.lower() == "clear":
+            os.system('clear')
         if user_input.lower() in ("exit", "quit", "q"):
-            print(f"{GRAY}À bientôt !{RESET}\n")
+            console.print("[muted]À bientôt ![/muted]\n")
             break
 
         history = run_once(user_input, web_mode=web_mode, history=history)
@@ -412,19 +431,13 @@ def main() -> None:
     check_env()
 
     parser = argparse.ArgumentParser(prog="gg", add_help=False)
-    parser.add_argument("-i", "--interactive", action="store_true",
-                        help="Mode chat interactif")
-    parser.add_argument("-n", "--no-web",      action="store_true",
-                        help="Forcer sans recherche web")
-    parser.add_argument("-w", "--web",         action="store_true",
-                        help="Forcer avec recherche web")
-    parser.add_argument("-h", "--help",        action="store_true",
-                        help="Afficher l'aide")
-    parser.add_argument("question", nargs="*",
-                        help="Question directe")
+    parser.add_argument("-i", "--interactive", action="store_true")
+    parser.add_argument("-n", "--no-web",      action="store_true")
+    parser.add_argument("-w", "--web",         action="store_true")
+    parser.add_argument("-h", "--help",        action="store_true")
+    parser.add_argument("question", nargs="*")
     args = parser.parse_args()
 
-    # -n prend le dessus sur -w si les deux sont passés
     if args.no_web:
         web_mode = "force_off"
     elif args.web:
@@ -433,25 +446,35 @@ def main() -> None:
         web_mode = "auto"
 
     if args.help:
-        print(f"""
-{CYAN}{BOLD}gg{RESET} — assistant terminal IA · LangGraph + Nemotron + Serper
+        help_md = f"""# gg — assistant terminal IA
 
-{BOLD}Usage:{RESET}
-  gg "question"      Décide automatiquement si une recherche est utile
-  gg -n "question"   Forcer sans recherche web (plus rapide)
-  gg -w "question"   Forcer avec recherche web
-  gg -i              Mode chat interactif (web auto)
-  gg -i -n           Mode chat interactif (web désactivé)
-  gg -i -w           Mode chat interactif (web toujours actif)
+**LangGraph · Nemotron · Serper · Rich**
 
-{BOLD}Variables d'environnement:{RESET}
-  OPENROUTER_API_KEY     Clé OpenRouter · https://openrouter.ai/
-  SERPER_API_KEY         Clé Serper     · https://serper.dev/
+## Usage
 
-{BOLD}Modèle:{RESET}  {MODEL}
-{BOLD}Graph:{RESET}   [router] → [search?] → [llm]
-{BOLD}Cache:{RESET}   ~/.cache/uv/  —  vider avec : uv cache clean
-""")
+| Commande | Description |
+|---|---|
+| `gg "question"` | Web auto-décidé |
+| `gg -n "question"` | Sans recherche (rapide) |
+| `gg -w "question"` | Avec recherche forcée |
+| `gg -i` | Mode interactif (web auto) |
+| `gg -i -n` | Mode interactif (web off) |
+| `gg -i -w` | Mode interactif (web on) |
+
+## Variables d'environnement
+
+- `OPENROUTER_API_KEY` → https://openrouter.ai/
+- `SERPER_API_KEY` → https://serper.dev/
+
+## Modèle
+
+`{MODEL}`
+
+## Graph
+
+`[router] → [search?] → [llm]`
+"""
+        console.print(Panel(Markdown(help_md), border_style="cyan", box=box.ROUNDED, padding=(1, 2)))
         sys.exit(0)
 
     if args.interactive:
