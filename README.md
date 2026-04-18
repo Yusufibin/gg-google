@@ -100,24 +100,30 @@ gg -i -n
 gg -h
 ```
 
+
 ---
 
 ## How it works
 
-gg is built as a [LangGraph](https://github.com/langchain-ai/langgraph) graph with two nodes and conditional routing:
+gg is built as a [LangGraph](https://github.com/langchain-ai/langgraph) graph with three nodes and conditional routing:
 
 ```
-[entry]
-  ├─ web on  ──► [search] ──► [llm] ──► END
-  └─ web off ──────────────► [llm] ──► END
+[router]
+  ├─ needs search  ──► [search] ──► [llm] ──► END
+  └─ no search     ──────────────► [llm] ──► END
 ```
 
-- **search node** — calls the Serper API and stores results in the graph state
+- **router node** — makes a fast, non-streaming LLM call to decide whether a web search is actually needed. It also rewrites the raw question into an optimized search query. Three modes are available: `auto` (default), `force_on` (`-w`), `force_off` (`-n`)
+- **search node** — calls the Serper API using the refined query and stores results in the graph state
 - **llm node** — builds the prompt (system + history + question), streams the response
+
+The router includes the last two messages of the conversation as context, so follow-up questions in interactive mode don't trigger unnecessary searches.
 
 Search results are injected into the `SystemMessage` rather than as fake conversation turns, which keeps the session history clean and multi-turn context intact.
 
 ---
+
+
 
 ## Configuration
 
